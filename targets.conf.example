@@ -1,7 +1,7 @@
 # web-ping.sh targets. Copy to targets.conf (which git ignores) and edit,
 # or let ./add-target.sh create and maintain it for you.
 #
-# Format: URL | MAX_HOPS | COOKIE_PATH | EXPECTED_TEXT
+# Format: URL | MAX_HOPS | COOKIE_PATH | EXPECTED_TEXT | FINAL_URL
 #
 #   URL            Page to fetch. Redirects are followed.
 #   MAX_HOPS       Most redirects allowed. Use the count from a logged-in
@@ -13,12 +13,25 @@
 #                  relative to the directory web-ping.sh is run from.
 #   EXPECTED_TEXT  Text the response must contain (blank = anything). Take it
 #                  from what curl receives, not what the browser shows, and
-#                  pick something only present when logged in.
+#                  pick something only present when logged in. Start it with
+#                  '~' to ignore upper/lower case: ~sign out
+#                  (to match a literal leading '~' with case, write '\~').
+#                  Values in any field cannot contain '|'.
+#   FINAL_URL      Optional. Checks the URL of the page you end up on after
+#                  the redirects. Space-separated terms, ignoring case: each
+#                  must appear in that URL; a term starting with '!' must NOT.
+#                  It catches being sent somewhere other than intended, such
+#                  as a maintenance page during patching, a sign-in page when
+#                  a session expires, or an error page, even when that page
+#                  returns 200 and shares text (like a site footer) with the
+#                  real one. Example: "app.example.com/home !maintenance".
+#                  Leave the field off, or use '-', to skip the check.
 #
 # Lines starting with '#' and blank lines are ignored.
 
 # Public page, no login, must load without redirects
 https://www.example.com/|0|-|Example Domain
 
-# Page behind a login, one expected redirect, text only shown when signed in
-https://app.example.com/home|1|./cookies/app.example.com|Sign out
+# Page behind a login: one expected redirect, text only shown when signed in
+# (any case), and it must end on the app's home page, not a login page
+https://app.example.com/|1|./cookies/app.example.com|~sign out|app.example.com/home !login
