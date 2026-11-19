@@ -1,0 +1,24 @@
+# web-ping.sh targets. Copy to targets.conf (which git ignores) and edit,
+# or let ./add-target.sh create and maintain it for you.
+#
+# Format: URL | MAX_HOPS | COOKIE_PATH | EXPECTED_TEXT
+#
+#   URL            Page to fetch. Redirects are followed.
+#   MAX_HOPS       Most redirects allowed. Use the count from a logged-in
+#                  `./web-ping.sh --trace` run; 0 if the URL loads directly.
+#                  A strict limit makes an expired cookie (which redirects to
+#                  a login page) fail instead of passing.
+#   COOKIE_PATH    Netscape-format cookie file for sites that need a login,
+#                  or '-' for none. Create it with ./add-target.sh. Paths are
+#                  relative to the directory web-ping.sh is run from.
+#   EXPECTED_TEXT  Text the response must contain (blank = anything). Take it
+#                  from what curl receives, not what the browser shows, and
+#                  pick something only present when logged in.
+#
+# Lines starting with '#' and blank lines are ignored.
+
+# Public page, no login, must load without redirects
+https://www.example.com/|0|-|Example Domain
+
+# Page behind a login, one expected redirect, text only shown when signed in
+https://app.example.com/home|1|./cookies/app.example.com|Sign out

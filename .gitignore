@@ -1,0 +1,8 @@
+# Browser session cookies: secrets, never commit
+cookies/
+
+# Runtime output
+health_check.log
+
+# Site-specific targets (internal URLs)
+targets.conf
