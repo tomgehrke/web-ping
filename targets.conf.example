@@ -1,16 +1,28 @@
 # web-ping.sh targets. Copy to targets.conf (which git ignores) and edit,
 # or let ./add-target.sh create and maintain it for you.
 #
-# Format: URL | MAX_HOPS | COOKIE_PATH | EXPECTED_TEXT | FINAL_URL
+# Format: URL | MAX_HOPS | AUTH | EXPECTED_TEXT | FINAL_URL
 #
 #   URL            Page to fetch. Redirects are followed.
 #   MAX_HOPS       Most redirects allowed. Use the count from a logged-in
 #                  `./web-ping.sh --trace` run; 0 if the URL loads directly.
 #                  A strict limit makes an expired cookie (which redirects to
 #                  a login page) fail instead of passing.
-#   COOKIE_PATH    Netscape-format cookie file for sites that need a login,
-#                  or '-' for none. Create it with ./add-target.sh. Paths are
-#                  relative to the directory web-ping.sh is run from.
+#   AUTH           How the target logs in. One of:
+#                    -                    no login
+#                    PATH or cookie:PATH  Netscape-format cookie file, made by
+#                                         ./add-target.sh. Paths are relative
+#                                         to the directory web-ping.sh runs in.
+#                    token:NAME           bearer token from environment
+#                                         variable $NAME, sent as
+#                                         "Authorization: Bearer <token>",
+#                                         over https, to the target's host only
+#                    token:NAME@DOMAIN    same, but also sent to DOMAIN and all
+#                                         its subdomains, for sites that
+#                                         redirect between hosts; pick the
+#                                         narrowest domain that covers them
+#                  The token itself never goes in this file. If $NAME isn't
+#                  set, the target fails.
 #   EXPECTED_TEXT  Text the response must contain (blank = anything). Take it
 #                  from what curl receives, not what the browser shows, and
 #                  pick something only present when logged in. Start it with
@@ -35,3 +47,9 @@ https://www.example.com/|0|-|Example Domain
 # Page behind a login: one expected redirect, text only shown when signed in
 # (any case), and it must end on the app's home page, not a login page
 https://app.example.com/|1|./cookies/app.example.com|~sign out|app.example.com/home !login
+
+# Page that needs a bearer token, read from $APP_TOKEN at run time
+https://api.example.com/status|0|token:APP_TOKEN|"ok"
+
+# Starts on www and redirects to app; the token must reach both hosts
+https://www.example.com/|1|token:APP_TOKEN@example.com|~sign out|app.example.com

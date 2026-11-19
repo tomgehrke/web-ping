@@ -92,21 +92,50 @@ choose() {
         done
 }
 
-# Look up URL in the config. Sets E_HOPS, E_COOKIE, E_TEXT, E_FINAL;
-# returns 1 if absent.
+# Look up URL in the config. Sets E_HOPS, E_TEXT, E_FINAL and, from the AUTH
+# field, E_COOKIE (cookie file) or E_TOKEN (NAME or NAME@domain); returns 1 if
+# absent.
 find_entry() {
-        local want="$1" u h c t f
+        local want="$1" u h a t f x
         [[ -f "$CONFIG_FILE" ]] || return 1
-        while IFS='|' read -r u h c t f || [[ -n "${u:-}" ]]; do
-                u="${u:-}"; h="${h:-}"; c="${c:-}"; t="${t:-}"; f="${f:-}"
-                trim u; trim h; trim c; trim t; trim f
+        while IFS='|' read -r u h a t f x || [[ -n "${u:-}" ]]; do
+                u="${u:-}"; h="${h:-}"; a="${a:-}"; t="${t:-}"; f="${f:-}"
+                trim u; trim h; trim a; trim t; trim f
                 [[ -z "$u" || "$u" == \#* ]] && continue
                 if [[ "$u" == "$want" ]]; then
-                        E_HOPS="$h"; E_COOKIE="$c"; E_TEXT="$t"; E_FINAL="$f"
+                        E_HOPS="$h"; E_TEXT="$t"; E_FINAL="$f"
+                        E_COOKIE=""; E_TOKEN=""; E_BLANK=0
+                        case "${a,,}" in
+                                "")       E_BLANK=1 ;;
+                                -)        ;;
+                                token:*)  E_TOKEN="${a#*:}"; E_TOKEN="${E_TOKEN#\$}" ;;
+                                cookie:*) E_COOKIE="${a#*:}" ;;
+                                *)        E_COOKIE="$a" ;;
+                        esac
                         return 0
                 fi
         done < "$CONFIG_FILE"
         return 1
+}
+
+# auth_field COOKIE TOKEN [BLANK]: the AUTH config value for a cookie file or
+# token; empty when BLANK is 1 (use web-ping's DEFAULT_COOKIE_FILE argument).
+# A cookie path that itself starts with "word:" gets an explicit cookie:
+# prefix so web-ping doesn't read the word as an AUTH type.
+auth_field() {
+        if [[ "${3:-0}" == 1 ]]; then
+                return 0
+        elif [[ -n "${2:-}" ]]; then
+                printf 'token:%s' "$2"
+        elif [[ -n "${1:-}" && "$1" != "-" ]]; then
+                if [[ "$1" =~ ^[A-Za-z]+: ]]; then
+                        printf 'cookie:%s' "$1"
+                else
+                        printf '%s' "$1"
+                fi
+        else
+                printf -- '-'
+        fi
 }
 
 # Remove the line for URL from the config, keeping the file's permissions.
@@ -119,7 +148,8 @@ remove_entry() {
         rm -f "$tmp"
 }
 
-# entry_line URL HOPS COOKIE TEXT FINAL: print a config line (FINAL omitted if empty)
+# entry_line URL HOPS AUTH TEXT FINAL: print a config line (FINAL left off if
+# empty).
 entry_line() {
         printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4"
         [[ -n "${5:-}" ]] && printf '|%s' "$5"
@@ -129,8 +159,9 @@ entry_line() {
 append_entry() {
         if [[ ! -f "$CONFIG_FILE" ]]; then
                 {
-                        printf '%s\n' "# Format: URL | MAX_HOPS | COOKIE_PATH ('-' for none) | EXPECTED_TEXT | FINAL_URL"
+                        printf '%s\n' "# Format: URL | MAX_HOPS | AUTH | EXPECTED_TEXT | FINAL_URL"
                         printf '%s\n' "# EXPECTED_TEXT starting with '~' ignores case ('\\~' = literal '~'). FINAL_URL (optional): space-separated terms, '!term' = must not contain."
+                        printf '%s\n' "# AUTH: '-' none, PATH or cookie:PATH cookie file, token:NAME[@domain] bearer token from \$NAME."
                         printf '%s\n' "# See targets.conf.example for details."
                 } > "$CONFIG_FILE"
         elif [[ -s "$CONFIG_FILE" && -n "$(tail -c1 "$CONFIG_FILE")" ]]; then
@@ -329,6 +360,54 @@ ask_checks() {
         done
 }
 
+# ask_token DEFAULT: sets TOKEN to NAME (token sent to the target's own host)
+# or NAME@domain (also sent to that domain and its subdomains). DEFAULT uses
+# the same form.
+ask_token() {
+        local def_var="${1%%@*}" def_domain="" var domain host
+        [[ "$1" == *@* ]] && def_domain="${1#*@}"
+        host="${URL#*://}"; host="${host%%[/?#]*}"; host="${host##*@}"; host="${host%%:*}"
+        host="${host,,}"
+
+        note ""
+        note "Enter the name of the environment variable that will hold the token. It is sent"
+        note "as an \"Authorization: Bearer\" header, only over https. The token itself is"
+        note "never saved."
+        while :; do
+                ask var "Token variable name" "$def_var"
+                var="${var#\$}"
+                [[ "$var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && break
+                note "  use letters, digits and _ only, not starting with a digit"
+        done
+        TOKEN="$var"
+
+        note ""
+        note "By default the token is sent only to $host. If the site redirects to other hosts"
+        note "that also need it (e.g. www.example.com -> app.example.com), enter the domain"
+        note "they share (example.com); it and all its subdomains will get the token. Only"
+        note "name a domain you trust completely."
+        while :; do
+                ask domain "Token domain" "${def_domain:-$host}"
+                domain="${domain,,}"
+                domain="${domain#.}"
+                if [[ "$domain" == *[!a-z0-9.-]* || "$domain" != *.* && "$domain" != "$host" ]]; then
+                        note "  enter a domain name like example.com"
+                        continue
+                fi
+                if [[ "$host" != "$domain" && "$host" != *".$domain" ]]; then
+                        note "  $host is not in $domain; enter $host or a domain it belongs to"
+                        continue
+                fi
+                break
+        done
+        [[ "$domain" != "$host" ]] && TOKEN="$var@$domain"
+
+        if [[ -z "${!var:-}" ]]; then
+                note "  Note: \$$var is not set in this shell, so the test will fail. Run"
+                note "  'export $var=...' first, or save anyway and set it before checks run."
+        fi
+}
+
 [[ -x "$WEB_PING" ]] || die "web-ping.sh not found next to this script ($WEB_PING)"
 
 ask URL "URL to check (e.g. https://app.example.com/psp/ps/)"
@@ -336,11 +415,11 @@ ask URL "URL to check (e.g. https://app.example.com/psp/ps/)"
 [[ "$URL" != *'|'* ]] || die "URL cannot contain '|'"
 
 MODE=new
-E_HOPS=""; E_COOKIE=""; E_TEXT=""; E_FINAL=""
+E_HOPS=""; E_COOKIE=""; E_TEXT=""; E_FINAL=""; E_TOKEN=""; E_BLANK=0
 if find_entry "$URL"; then
         note ""
-        note "Already in $CONFIG_FILE: $(entry_line "$URL" "$E_HOPS" "$E_COOKIE" "$E_TEXT" "$E_FINAL")"
-        if [[ -n "$E_COOKIE" && "$E_COOKIE" != "-" ]]; then
+        note "Already in $CONFIG_FILE: $(entry_line "$URL" "$E_HOPS" "$(auth_field "$E_COOKIE" "$E_TOKEN" "$E_BLANK")" "$E_TEXT" "$E_FINAL")"
+        if [[ -n "$E_COOKIE" ]]; then
                 note "  c) Refresh its cookies only"
                 note "  r) Replace the whole entry"
                 note "  q) Quit"
@@ -354,34 +433,60 @@ if find_entry "$URL"; then
 fi
 
 if [[ "$MODE" == c ]]; then
-        HOPS="$E_HOPS"; COOKIE="$E_COOKIE"; TEXT="$E_TEXT"; FINAL="$E_FINAL"
+        HOPS="$E_HOPS"; COOKIE="$E_COOKIE"; TEXT="$E_TEXT"; FINAL="$E_FINAL"; TOKEN=""; BLANK=0
         make_cookies "$COOKIE" "$URL"
 else
         ask_checks "${E_HOPS:-1}" "$E_TEXT" "$E_FINAL"
 
         COOKIE="-"
+        TOKEN=""
+        BLANK=0
         default_auth=n
-        [[ -n "$E_COOKIE" && "$E_COOKIE" != "-" ]] && default_auth=y
-        if confirm "Does this site need a login cookie?" "$default_auth"; then
-                host="${URL#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
-                while :; do
-                        def_cookie="./cookies/$host"
-                        [[ -n "$E_COOKIE" && "$E_COOKIE" != "-" ]] && def_cookie="$E_COOKIE"
-                        ask COOKIE "Cookie file path" "$def_cookie"
-                        [[ "$COOKIE" == "-" || -z "$COOKIE" || "$COOKIE" == *'|'* ]] \
-                                && { note "  enter a file path (no '|')"; continue; }
-                        if [[ -e "$COOKIE" && "$COOKIE" != "$E_COOKIE" ]]; then
-                                confirm "$COOKIE already exists. Overwrite it?" n || continue
-                        fi
-                        break
-                done
-                make_cookies "$COOKIE" "$URL"
+        auth_choices="n c t"
+        [[ -n "$E_COOKIE" ]] && default_auth=c
+        [[ -n "$E_TOKEN" ]] && default_auth=t
+        note ""
+        note "How does this site authenticate?"
+        if (( E_BLANK )); then
+                note "  d) Keep using web-ping's default cookie file argument (AUTH left blank)"
+                default_auth=d
+                auth_choices="d $auth_choices"
         fi
+        note "  n) No login needed"
+        note "  c) Cookies copied from your browser"
+        note "  t) A bearer token from an environment variable"
+        choose auth_kind "Choice" "$default_auth" "$auth_choices"
+        case "$auth_kind" in
+                d)
+                        BLANK=1
+                        note "  Note: the test below runs without the default cookie file."
+                        ;;
+                c)
+                        host="${URL#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
+                        while :; do
+                                ask COOKIE "Cookie file path" "${E_COOKIE:-./cookies/$host}"
+                                [[ "${COOKIE,,}" == cookie:* ]] && COOKIE="${COOKIE#*:}"
+                                if [[ "$COOKIE" == "-" || -z "$COOKIE" || "$COOKIE" == *'|'* \
+                                        || "$COOKIE" == *[[:space:]]* ]]; then
+                                        note "  enter a file path (no spaces or '|')"
+                                        continue
+                                fi
+                                if [[ -e "$COOKIE" && "$COOKIE" != "$E_COOKIE" ]]; then
+                                        confirm "$COOKIE already exists. Overwrite it?" n || continue
+                                fi
+                                break
+                        done
+                        make_cookies "$COOKIE" "$URL"
+                        ;;
+                t)
+                        ask_token "$E_TOKEN"
+                        ;;
+        esac
 fi
 
 # Test, and let the user fix things until it passes or they decide.
 while :; do
-        if run_test "$URL" "$HOPS" "$COOKIE" "$TEXT" "$FINAL"; then
+        if run_test "$URL" "$HOPS" "$(auth_field "$COOKIE" "$TOKEN" "$BLANK")" "$TEXT" "$FINAL"; then
                 note "Check passed."
                 break
         fi
@@ -394,7 +499,7 @@ while :; do
                 options="e $options"
                 default_action=e
         fi
-        if [[ "$COOKIE" != "-" ]]; then
+        if [[ -n "$COOKIE" && "$COOKIE" != "-" ]]; then
                 note "  r) Re-enter cookies"
                 options="r $options"
                 default_action=r
@@ -426,5 +531,6 @@ if [[ "$MODE" == c ]]; then
 fi
 
 [[ "$MODE" == r ]] && remove_entry "$URL"
-append_entry "$URL" "$HOPS" "$COOKIE" "$TEXT" "$FINAL"
-note "Saved to $CONFIG_FILE: $(entry_line "$URL" "$HOPS" "$COOKIE" "$TEXT" "$FINAL")"
+AUTH=$(auth_field "$COOKIE" "$TOKEN" "$BLANK")
+append_entry "$URL" "$HOPS" "$AUTH" "$TEXT" "$FINAL"
+note "Saved to $CONFIG_FILE: $(entry_line "$URL" "$HOPS" "$AUTH" "$TEXT" "$FINAL")"
