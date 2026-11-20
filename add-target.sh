@@ -1,50 +1,81 @@
 #!/usr/bin/env bash
-# Interactive helper for web-ping.sh: add or update a target in the config file
-# and, when the site needs authentication, build its Netscape-format cookie file
-# from cookies copied out of the browser.
 #
-# Usage: ./add-target.sh [CONFIG_FILE]   (default: ./targets.conf)
-# Run it from the same directory you run web-ping.sh from, since cookie paths
-# in the config are relative to the current directory.
+# add-target.sh: interactive helper for web-ping.sh
+#
+# Adds a target to the config file, or updates one that's already there. It
+# asks for each check and how the site logs in, then sets that up: for
+# cookies it builds a Netscape-format cookie file from the Cookie header you
+# copy out of your browser, and for a bearer token it records the name of the
+# environment variable that will hold it. Before saving, it tests the target
+# with web-ping.sh and lets you fix anything that fails.
+#
+# Usage
+#
+#   add-target.sh [CONFIG]
+#
+#       CONFIG defaults to ./targets.conf and is created if it doesn't exist.
+#
+#   Run it from the directory you run web-ping.sh from, because cookie paths
+#   in the config are relative to the current directory.
+
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 WEB_PING="$SCRIPT_DIR/web-ping.sh"
 CONFIG_FILE="${1:-./targets.conf}"
 
-# ---------------------------------------------------------------- helpers ---
-
 trim() {
+        # trim VAR
+        #
+        # Strip leading and trailing whitespace from the variable named VAR. The
+        # variable is changed in place, so pass its name, not its value.
+
         local -n _ref="$1"
         _ref="${_ref#"${_ref%%[![:space:]]*}"}"
         _ref="${_ref%"${_ref##*[![:space:]]}"}"
 }
 
+# die MESSAGE: print an error and exit. note MESSAGE: print a line.
 die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
-# ask VAR "Prompt" [default]: read one trimmed line, falling back to default
 ask() {
+        # ask VAR "Prompt" [DEFAULT]
+        #
+        # Prompt for one line of input, trim it, and store it in the variable named
+        # VAR. If the answer is empty, DEFAULT is used instead.
+
         local -n __a_out="$1"
-        local __prompt="$2" __def="${3:-}" __line
+        local __prompt="$2"
+        local __def="${3:-}"
+        local __line
         [[ -n "$__def" ]] && __prompt+=" [$__def]"
         read -r -p "$__prompt: " __line || die "input closed"
         trim __line
         __a_out="${__line:-$__def}"
 }
 
-# ask_secret VAR "Prompt": like ask, but input is not echoed. On a terminal the
-# tty is switched out of canonical mode for the read, because canonical mode
-# silently truncates a line at 4095 bytes and cookie headers can be longer.
-# (Side effect: backspace does not work at this prompt. Paste, then Enter.)
+# restore_tty: put the terminal back the way ask_secret found it. It runs on
+# exit and when the script is interrupted, so the terminal is never left with
+# echo off.
 TTY_SAVED=""
 restore_tty() { [[ -n "$TTY_SAVED" ]] && stty "$TTY_SAVED" 2>/dev/null; TTY_SAVED=""; }
 trap restore_tty EXIT
 trap 'restore_tty; printf "\n"; exit 130' INT TERM
 
 ask_secret() {
+        # ask_secret VAR "Prompt"
+        #
+        # Like ask, but the input isn't shown on screen. On a terminal, the tty is
+        # taken out of canonical (line-editing) mode for the read, because canonical
+        # mode silently cuts a line off at 4095 bytes and cookie headers can be
+        # longer. The catch is that backspace doesn't work at this prompt, so paste
+        # the value and press Enter. restore_tty puts the terminal back afterwards,
+        # including when the script is interrupted.
+
         local -n __s_out="$1"
-        local __line="" __rc=0
+        local __line=""
+        local __rc=0
         if [[ -t 0 ]]; then
                 TTY_SAVED=$(stty -g)
                 stty -echo -icanon min 1 time 0
@@ -60,9 +91,16 @@ ask_secret() {
         __s_out="$__line"
 }
 
-# confirm "Question" y|n: returns 0 for yes
 confirm() {
-        local __prompt="$1" __def="$2" __line __hint="y/N"
+        # confirm "Question" y|n
+        #
+        # Ask a yes/no question, with y or n as the answer used when Enter is
+        # pressed. Returns 0 for yes and 1 for no.
+
+        local __prompt="$1"
+        local __def="$2"
+        local __line
+        local __hint="y/N"
         [[ "$__def" == y ]] && __hint="Y/n"
         while :; do
                 read -r -p "$__prompt [$__hint]: " __line || die "input closed"
@@ -76,10 +114,17 @@ confirm() {
         done
 }
 
-# choose VAR "Prompt" default "a b c": read one of the listed single letters
 choose() {
+        # choose VAR "Prompt" DEFAULT "a b c"
+        #
+        # Ask until the answer is one of the listed single letters, and store it in
+        # the variable named VAR. Enter on its own picks DEFAULT.
+
         local -n __c_out="$1"
-        local __prompt="$2" __def="$3" __valid=" $4 " __line
+        local __prompt="$2"
+        local __def="$3"
+        local __valid=" $4 "
+        local __line
         while :; do
                 read -r -p "$__prompt [$__def]: " __line || die "input closed"
                 trim __line
@@ -92,11 +137,26 @@ choose() {
         done
 }
 
-# Look up URL in the config. Sets E_HOPS, E_TEXT, E_FINAL and, from the AUTH
-# field, E_COOKIE (cookie file) or E_TOKEN (NAME or NAME@domain); returns 1 if
-# absent.
 find_entry() {
-        local want="$1" u h a t f x
+        # find_entry URL
+        #
+        # Look up URL in the config. Returns 1 if it isn't there.
+        #
+        # Sets:
+        # - E_HOPS:             The entry's MAX_HOPS.
+        # - E_TEXT:             The entry's EXPECTED_TEXT.
+        # - E_FINAL:            The entry's FINAL_URL.
+        # - E_COOKIE:           Its cookie file, if AUTH names one.
+        # - E_TOKEN:            NAME or NAME@domain, if AUTH names a token.
+        # - E_BLANK:            1 if AUTH is blank, so web-ping's default applies.
+
+        local want="$1"
+        local u
+        local h
+        local a
+        local t
+        local f
+        local x
         [[ -f "$CONFIG_FILE" ]] || return 1
         while IFS='|' read -r u h a t f x || [[ -n "${u:-}" ]]; do
                 u="${u:-}"; h="${h:-}"; a="${a:-}"; t="${t:-}"; f="${f:-}"
@@ -118,11 +178,15 @@ find_entry() {
         return 1
 }
 
-# auth_field COOKIE TOKEN [BLANK]: the AUTH config value for a cookie file or
-# token; empty when BLANK is 1 (use web-ping's DEFAULT_COOKIE_FILE argument).
-# A cookie path that itself starts with "word:" gets an explicit cookie:
-# prefix so web-ping doesn't read the word as an AUTH type.
 auth_field() {
+        # auth_field COOKIE TOKEN [BLANK]
+        #
+        # Print the AUTH value to write to the config for a cookie file or a token.
+        # When BLANK is 1 it prints nothing, so web-ping falls back to its
+        # DEFAULT_COOKIE_FILE argument. A cookie path that itself starts with a word
+        # and a colon gets an explicit cookie: prefix, so web-ping doesn't mistake
+        # the word for an AUTH type.
+
         if [[ "${3:-0}" == 1 ]]; then
                 return 0
         elif [[ -n "${2:-}" ]]; then
@@ -138,8 +202,11 @@ auth_field() {
         fi
 }
 
-# Remove the line for URL from the config, keeping the file's permissions.
 remove_entry() {
+        # remove_entry URL
+        #
+        # Remove the line for URL from the config, keeping the file's permissions.
+
         local tmp
         tmp=$(mktemp)
         awk -F'|' -v u="$1" '{ f = $1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", f); if (f == u) next; print }' \
@@ -148,15 +215,22 @@ remove_entry() {
         rm -f "$tmp"
 }
 
-# entry_line URL HOPS AUTH TEXT FINAL: print a config line (FINAL left off if
-# empty).
 entry_line() {
+        # entry_line URL HOPS AUTH TEXT FINAL
+        #
+        # Print one config line. FINAL is left off when it's empty.
+
         printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4"
         [[ -n "${5:-}" ]] && printf '|%s' "$5"
         printf '\n'
 }
 
 append_entry() {
+        # append_entry URL HOPS AUTH TEXT FINAL
+        #
+        # Add a config line to the end of the config. A new config file starts with
+        # a short header explaining the format.
+
         if [[ ! -f "$CONFIG_FILE" ]]; then
                 {
                         printf '%s\n' "# Format: URL | MAX_HOPS | AUTH | EXPECTED_TEXT | FINAL_URL"
@@ -170,13 +244,17 @@ append_entry() {
         entry_line "$@" >> "$CONFIG_FILE"
 }
 
-# ------------------------------------------------------------- cookies ------
-
 C_NAMES=()
 C_VALUES=()
 
 add_cookie() {
-        local name="$1" value="$2"
+        # add_cookie NAME VALUE
+        #
+        # Add one cookie to C_NAMES and C_VALUES. Invalid names, values containing
+        # a tab, and repeats of a name already added are skipped with a note.
+
+        local name="$1"
+        local value="$2"
         if [[ -z "$name" || "$name" =~ [[:space:]] ]]; then
                 note "  skipped: invalid cookie name '${name}'"
                 return
@@ -198,7 +276,17 @@ add_cookie() {
 }
 
 collect_cookies() {
-        local mode line part name value
+        # collect_cookies
+        #
+        # Ask for cookies, either pasted as a whole Cookie header or entered one
+        # name and value at a time, and fill C_NAMES and C_VALUES. Exits if none
+        # were entered.
+
+        local mode
+        local line
+        local part
+        local name
+        local value
         local -a parts
         C_NAMES=()
         C_VALUES=()
@@ -239,12 +327,24 @@ collect_cookies() {
         note "Got ${#C_NAMES[@]} cookie(s): ${C_NAMES[*]}"
 }
 
-# write_cookie_file PATH DOMAIN URL
 write_cookie_file() {
-        local path="$1" domain="$2" url="$3" sub=FALSE secure=FALSE i
+        # write_cookie_file PATH DOMAIN URL
+        #
+        # Write the cookies in C_NAMES and C_VALUES to PATH in the Netscape format
+        # that curl reads. The file is readable only by you, and a new cookie
+        # directory is too. A DOMAIN with a leading dot also covers its subdomains,
+        # and an https URL marks the cookies as secure.
+
+        local path="$1"
+        local domain="$2"
+        local url="$3"
+        local sub=FALSE
+        local secure=FALSE
+        local i
         [[ "$domain" == .* ]] && sub=TRUE
         [[ "$url" == https://* ]] && secure=TRUE
-        local dir tmp
+        local dir
+        local tmp
         dir=$(dirname -- "$path")
         if [[ ! -d "$dir" ]]; then
                 mkdir -p -- "$dir"
@@ -265,9 +365,17 @@ write_cookie_file() {
         note "Wrote $path"
 }
 
-# Ask for cookies and a domain, then write the file.
 make_cookies() {
-        local path="$1" url="$2" host domain def_domain
+        # make_cookies PATH URL
+        #
+        # Ask for the cookie domain and the cookies, then write them to PATH. When
+        # PATH already exists, its domain is offered as the default.
+
+        local path="$1"
+        local url="$2"
+        local host
+        local domain
+        local def_domain
         host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
         def_domain="$host"
         # When refreshing, keep the domain the existing file uses (e.g. .example.com).
@@ -287,10 +395,14 @@ make_cookies() {
         write_cookie_file "$path" "$domain" "$url"
 }
 
-# ---------------------------------------------------------------- testing ---
-
 run_test() {
-        local tmp rc=0
+        # run_test URL HOPS AUTH TEXT FINAL
+        #
+        # Check a single target with web-ping.sh, using a temporary config. Nothing
+        # is logged or emailed. Returns web-ping's exit code.
+
+        local tmp
+        local rc=0
         tmp=$(mktemp)
         entry_line "$@" > "$tmp"
         note ""
@@ -300,13 +412,20 @@ run_test() {
         return "$rc"
 }
 
-# ------------------------------------------------------------------- main ---
-
-# ask_checks DEFAULT_HOPS DEFAULT_TEXT DEFAULT_FINAL: sets HOPS, TEXT and FINAL.
-# TEXT carries a leading '~' when the match should ignore case.
 ask_checks() {
+        # ask_checks DEFAULT_HOPS DEFAULT_TEXT DEFAULT_FINAL
+        #
+        # Ask for the target's checks, offering the defaults given.
+        #
+        # Sets:
+        # - HOPS:               The most redirects allowed.
+        # - TEXT:               The expected text, with a leading '~' if the match
+        #                       should ignore case.
+        # - FINAL:              The FINAL_URL terms, or empty to skip that check.
+
         # Stored form: '~text' = ignore case, '\~text' = literal leading '~'.
-        local def_text="$2" def_nocase=n
+        local def_text="$2"
+        local def_nocase=n
         if [[ "$def_text" == '\~'* ]]; then
                 def_text="${def_text#'\'}"
         elif [[ "$def_text" == '~'?* ]]; then
@@ -360,11 +479,19 @@ ask_checks() {
         done
 }
 
-# ask_token DEFAULT: sets TOKEN to NAME (token sent to the target's own host)
-# or NAME@domain (also sent to that domain and its subdomains). DEFAULT uses
-# the same form.
 ask_token() {
-        local def_var="${1%%@*}" def_domain="" var domain host
+        # ask_token DEFAULT
+        #
+        # Ask for the name of the environment variable holding the bearer token, and
+        # the domain it may be sent to. Sets TOKEN to NAME when the token goes only
+        # to the target's own host, or NAME@domain when it may also go to that domain
+        # and its subdomains. DEFAULT uses the same form.
+
+        local def_var="${1%%@*}"
+        local def_domain=""
+        local var
+        local domain
+        local host
         [[ "$1" == *@* ]] && def_domain="${1#*@}"
         host="${URL#*://}"; host="${host%%[/?#]*}"; host="${host##*@}"; host="${host%%:*}"
         host="${host,,}"
@@ -484,7 +611,8 @@ else
         esac
 fi
 
-# Test, and let the user fix things until it passes or they decide.
+# Test the target, and let the user fix things until it passes or they
+# decide to save or quit anyway.
 while :; do
         if run_test "$URL" "$HOPS" "$(auth_field "$COOKIE" "$TOKEN" "$BLANK")" "$TEXT" "$FINAL"; then
                 note "Check passed."
